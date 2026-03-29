@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from datetime import UTC, date, datetime
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,6 +23,7 @@ DB_PATH = "flight_tracker.db"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("flight_tracker_bot")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 @dataclass
@@ -59,6 +61,7 @@ class SerpApiClient:
             "api_key": self.api_key,
             "departure_id": origin.upper(),
             "arrival_id": destination.upper(),
+            "departure_date": departure_date,
             "outbound_date": departure_date,
             "adults": adults,
             "type": 2 if return_date else 1,
@@ -73,6 +76,24 @@ class SerpApiClient:
             params["max_price"] = max_price
 
         response = await self.http.get(self.BASE_URL, params=params)
+        if response.status_code >= 400:
+            error = self._extract_error_message(response)
+            raise ValueError(error)
+        return response.json()
+
+    @staticmethod
+    def _extract_error_message(response: httpx.Response) -> str:
+        try:
+            payload = response.json()
+        except Exception:
+            return f"SerpApi request failed with status {response.status_code}."
+        return (
+            payload.get("error")
+            or payload.get("message")
+            or payload.get("search_metadata", {}).get("status")
+            or f"SerpApi request failed with status {response.status_code}."
+        )
+
         response.raise_for_status()
         return response.json()
 
@@ -130,6 +151,7 @@ class FlightRepository:
                         last_price,
                         currency,
                         json.dumps(search_context) if search_context else None,
+                        datetime.now(UTC).isoformat(),
                         datetime.utcnow().isoformat(),
                     ),
                 )
@@ -224,6 +246,7 @@ class SearchResultsView(discord.ui.View):
 class FlightTrackerBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
+        intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
         self.repo = FlightRepository(DB_PATH)
         self.serp = SerpApiClient(SERPAPI_KEY)
@@ -321,6 +344,17 @@ class FlightTrackerBot(commands.Bot):
 bot = FlightTrackerBot()
 
 
+def _validate_iata(code: str) -> bool:
+    return len(code) == 3 and code.isalpha()
+
+
+def _parse_date(raw: str) -> Optional[date]:
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
 @bot.tree.command(name="search_flights", description="Search flights and add tracking with buttons")
 @app_commands.describe(
     origin="Origin airport code (e.g., JFK)",
@@ -344,6 +378,24 @@ async def search_flights(
     if not SERPAPI_KEY:
         await interaction.response.send_message("Missing SERPAPI_KEY in environment.", ephemeral=True)
         return
+    if not _validate_iata(origin) or not _validate_iata(destination):
+        await interaction.response.send_message(
+            "Origin and destination must be 3-letter IATA airport codes (e.g., JFK, EWR).",
+            ephemeral=True,
+        )
+        return
+    dep = _parse_date(departure_date)
+    if dep is None:
+        await interaction.response.send_message("`departure_date` must use YYYY-MM-DD.", ephemeral=True)
+        return
+    if return_date:
+        ret = _parse_date(return_date)
+        if ret is None:
+            await interaction.response.send_message("`return_date` must use YYYY-MM-DD.", ephemeral=True)
+            return
+        if ret < dep:
+            await interaction.response.send_message("`return_date` must be the same day or later than `departure_date`.", ephemeral=True)
+            return
 
     await interaction.response.defer(thinking=True)
     context_payload = {
@@ -356,6 +408,20 @@ async def search_flights(
         "max_price": max_price,
     }
 
+    try:
+        payload = await bot.serp.search_flights(**context_payload)
+        options = bot.parse_options(payload)
+        embed = bot.build_embed(options, f"Flights {origin.upper()} → {destination.upper()} ({departure_date})")
+        view = SearchResultsView(options, context_payload)
+        await interaction.followup.send(embed=embed, view=view)
+    except ValueError as exc:
+        await interaction.followup.send(
+            f"Search failed: {exc}\nTip: try major airport codes (e.g., STI → JFK) and valid dates.",
+            ephemeral=True,
+        )
+    except Exception:
+        logger.exception("Unexpected error in /search_flights")
+        await interaction.followup.send("Search failed due to an unexpected error. Please try again.", ephemeral=True)
     payload = await bot.serp.search_flights(**context_payload)
     options = bot.parse_options(payload)
     embed = bot.build_embed(options, f"Flights {origin.upper()} → {destination.upper()} ({departure_date})")
