@@ -1,8 +1,10 @@
+import asyncio
 import json
 import logging
 import os
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiosqlite
@@ -60,6 +62,7 @@ class SerpApiClient:
             "departure_id": origin.upper(),
             "arrival_id": destination.upper(),
             "departure_date": departure_date,
+            "outbound_date": departure_date,
             "adults": adults,
             "type": 2 if return_date else 1,
             "travel_class": travel_class,
@@ -90,6 +93,9 @@ class SerpApiClient:
             or payload.get("search_metadata", {}).get("status")
             or f"SerpApi request failed with status {response.status_code}."
         )
+
+        response.raise_for_status()
+        return response.json()
 
 
 class FlightRepository:
@@ -146,6 +152,7 @@ class FlightRepository:
                         currency,
                         json.dumps(search_context) if search_context else None,
                         datetime.now(UTC).isoformat(),
+                        datetime.utcnow().isoformat(),
                     ),
                 )
                 await db.commit()
@@ -415,6 +422,11 @@ async def search_flights(
     except Exception:
         logger.exception("Unexpected error in /search_flights")
         await interaction.followup.send("Search failed due to an unexpected error. Please try again.", ephemeral=True)
+    payload = await bot.serp.search_flights(**context_payload)
+    options = bot.parse_options(payload)
+    embed = bot.build_embed(options, f"Flights {origin.upper()} → {destination.upper()} ({departure_date})")
+    view = SearchResultsView(options, context_payload)
+    await interaction.followup.send(embed=embed, view=view)
 
 
 @bot.tree.command(name="track", description="Track a flight manually by flight code")
